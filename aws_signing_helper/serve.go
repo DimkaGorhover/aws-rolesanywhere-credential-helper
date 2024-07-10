@@ -12,7 +12,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -41,7 +40,6 @@ type RefreshableCred struct {
 type Endpoint struct {
 	Host    string
 	PortNum int
-	Server  *http.Server
 	TmpCred RefreshableCred
 }
 
@@ -382,12 +380,13 @@ func Serve(ctx context.Context, host string, port int, credentialsOptions Creden
 	refreshableCred.LastUpdated = time.Now()
 	refreshableCred.Type = REFRESHABLE_CRED_TYPE
 	endpoint := &Endpoint{PortNum: port, TmpCred: refreshableCred}
-	endpoint.Server = &http.Server{}
 	roleResourceParts := strings.Split(roleArn.Resource, "/")
 	roleName := roleResourceParts[len(roleResourceParts)-1] // Find role name without path
 	putTokenHandler, getRoleNameHandler, getCredentialsHandler := AllIssuesHandlers(&endpoint.TmpCred, roleName, &credentialsOptions, signer, signatureAlgorithm)
 
-	http.HandleFunc("/health", func(writer http.ResponseWriter, request *http.Request) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(http.StatusOK)
 	})
 
@@ -395,7 +394,7 @@ func Serve(ctx context.Context, host string, port int, credentialsOptions Creden
 
 	if metricsEnabled {
 
-		http.Handle(`/metrics`, promhttp.HandlerFor(
+		mux.Handle(`/metrics`, promhttp.HandlerFor(
 			prometheus.DefaultGatherer,
 			promhttp.HandlerOpts{
 				ErrorLog:           log.StandardLogger(),
@@ -422,9 +421,9 @@ func Serve(ctx context.Context, host string, port int, credentialsOptions Creden
 		getCredentialsHandler = promhttp.InstrumentHandlerCounter(createCounter(SECURITY_CREDENTIALS_RESOURCE_PATH+roleName), getCredentialsHandler)
 	}
 
-	http.Handle(TOKEN_RESOURCE_PATH, putTokenHandler)
-	http.Handle(SECURITY_CREDENTIALS_RESOURCE_PATH, getRoleNameHandler)
-	http.Handle(SECURITY_CREDENTIALS_RESOURCE_PATH+roleName, getCredentialsHandler)
+	mux.Handle(TOKEN_RESOURCE_PATH, putTokenHandler)
+	mux.Handle(SECURITY_CREDENTIALS_RESOURCE_PATH, getRoleNameHandler)
+	mux.Handle(SECURITY_CREDENTIALS_RESOURCE_PATH+roleName, getCredentialsHandler)
 
 	// Background thread that cleans up expired tokens
 	go func() {
@@ -466,29 +465,26 @@ func Serve(ctx context.Context, host string, port int, credentialsOptions Creden
 	}()
 
 	// Start the credentials endpoint
-	addr := fmt.Sprintf("%s:%d", host, port)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.WithError(err).Fatal("failed to create listener")
+	server := &http.Server{
+		Addr:    fmt.Sprintf("%s:%d", host, port),
+		Handler: mux,
 	}
 
-	log.Println("Local server started on port:", port)
+	log.Printf("Server started on: %s\n", server.Addr)
 	log.Println("Make it available to the sdk by running:")
-	log.Printf("export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://%s/", addr)
+	log.Printf("export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://%s/\n", server.Addr)
 
 	go func() {
-		if err := endpoint.Server.Serve(listener); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			if !errors.Is(err, http.ErrServerClosed) {
-				log.Fatal("Httpserver: ListenAndServe() error")
+				log.Error("Httpserver: ListenAndServe() error")
 			}
 		}
 	}()
 
 	<-ctx.Done()
 
-	if err := endpoint.Server.Close(); err != nil {
-		if !errors.Is(err, http.ErrServerClosed) {
-			log.WithError(err).Fatal("Httpserver: ListenAndServe() error")
-		}
+	if err := server.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.WithError(err).Error("http server close error")
 	}
 }
